@@ -970,3 +970,62 @@ input, textarea { user-select: text; -webkit-user-select: text; }
   font-weight: 600;
   letter-spacing: 0.04em;
 }
+
+/* ============================================================
+   Live View button (topbar) — large, prominent
+   ============================================================ */
+.live-view-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px !important;
+  font-size: 13px !important;
+  font-weight: 600;
+  text-decoration: none;
+  background: var(--accent, #6366f1);
+  color: #fff !important;
+  border: 1px solid var(--accent, #6366f1);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  white-space: nowrap;
+}
+.live-view-btn:hover {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  text-decoration: none;
+}
+.live-view-btn:active { transform: scale(0.97); }
+.live-view-btn .label { font-size: 13px; }
+
+/* Logout button — icon only, subtle */
+.icon-btn[data-action="logout"] {
+  color: var(--text-muted, #94a3b8);
+}
+.icon-btn[data-action="logout"]:hover {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+/* On mobile, hide the "Live View" text — keep only the icon */
+@media (max-width: 767px) {
+  .live-view-btn {
+    padding: 6px 10px !important;
+  }
+  .live-view-btn .label {
+    display: none;
+  }
+}
+
+/* Live viewer page — back-btn logout variant */
+.live-header .back-btn#logout-btn {
+  background: transparent;
+  border-color: var(--border, #2d3748);
+  color: var(--text-muted, #94a3b8);
+  cursor: pointer;
+}
+.live-header .back-btn#logout-btn:hover {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+}

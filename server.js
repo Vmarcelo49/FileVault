@@ -1,5 +1,5 @@
 /**
- * FileVault Server v2.3.0
+ * FileVault Server v2.3.1
  * https://github.com/Vmarcelo49/FileVault
  *
  * Self-hosted file transfer server with chunked uploads, automatic

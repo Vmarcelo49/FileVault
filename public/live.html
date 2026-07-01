@@ -228,6 +228,7 @@
         <span class="dot"></span>
         <span id="live-status">offline</span>
       </div>
+      <button class="back-btn" id="logout-btn" title="Sair (limpar token)" style="margin-left:auto">⏻ Sair</button>
     </header>
 
     <div id="banner" style="display:none"></div>
@@ -285,9 +286,43 @@
     // via HEAD every 2s; if Last-Modified changed, reloads the img.
     // ============================================================
 
-    const TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+    const TOKEN_STORAGE_KEY = 'filevault_token';
+
+    /**
+     * Get auth token with URL → localStorage fallback.
+     * Strips token from URL on first load (clean address bar + history).
+     */
+    function getAuthToken() {
+      const params = new URLSearchParams(window.location.search);
+      const urlToken = params.get('token');
+      if (urlToken) {
+        try { localStorage.setItem(TOKEN_STORAGE_KEY, urlToken); } catch (e) {}
+        params.delete('token');
+        const newSearch = params.toString();
+        const newUrl = window.location.pathname + (newSearch ? '?' + newSearch : '') + window.location.hash;
+        window.history.replaceState({}, '', newUrl);
+        return urlToken;
+      }
+      try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ''; } catch (e) { return ''; }
+    }
+
+    function clearAuthToken() {
+      try { localStorage.removeItem(TOKEN_STORAGE_KEY); } catch (e) {}
+    }
+
+    const TOKEN = getAuthToken();
 
     function buildUrl(path, params = {}) {
+      const url = new URL(path, window.location.origin);
+      // Never put token in URLs that appear in address bar
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, v);
+      }
+      return url.toString();
+    }
+
+    // For <img src>, <a href> — needs token in URL (no header support)
+    function buildAuthedUrl(path, params = {}) {
       const url = new URL(path, window.location.origin);
       if (TOKEN) url.searchParams.set('token', TOKEN);
       for (const [k, v] of Object.entries(params)) {
@@ -331,6 +366,7 @@
       fullscreenBtn: $('fullscreen-btn'),
       openBtn: $('open-btn'),
       stopBtn: $('stop-btn'),
+      logoutBtn: $('logout-btn'),
       statusSession: $('status-session'),
       statusLastFrame: $('status-last-frame'),
       statusFrames: $('status-frames'),
@@ -367,16 +403,6 @@
       return d.toLocaleString('pt-BR');
     }
 
-    function formatAge(ms) {
-      if (ms == null) return '—';
-      const s = Math.floor(ms / 1000);
-      if (s < 60) return `${s}s atrás`;
-      const m = Math.floor(s / 60);
-      if (m < 60) return `${m}min atrás`;
-      const h = Math.floor(m / 60);
-      return `${h}h atrás`;
-    }
-
     // Poll monitors list
     async function refreshMonitors() {
       try {
@@ -391,14 +417,15 @@
           return;
         }
         showBanner('');
+        const prevSelected = state.selectedSession;
         state.monitors = data.monitors || [];
-        renderSessionSelect();
+        renderSessionSelect(prevSelected);
       } catch (e) {
         showBanner(`Falha ao buscar monitores: ${e.message}`, true);
       }
     }
 
-    function renderSessionSelect() {
+    function renderSessionSelect(prevSelected = null) {
       const active = state.monitors.filter(m => m.monitor_alive);
       const inactive = state.monitors.filter(m => !m.monitor_alive);
 
@@ -406,6 +433,12 @@
 
       if (active.length === 0 && inactive.length === 0) {
         els.sessionSelect.innerHTML = '<option value="">— nenhum monitor ativo —</option>';
+        // No monitors — clear selection
+        if (state.selectedSession) {
+          state.selectedSession = null;
+          state.selectedMonitor = null;
+          showPlaceholder('Nenhum monitor ativo. Inicie um monitor via API ou CLI.');
+        }
         return;
       }
 
@@ -433,9 +466,23 @@
         els.sessionSelect.appendChild(grp);
       }
 
-      // Preserve selection if still present
-      if (state.selectedSession && state.monitors.find(m => m.session_id === state.selectedSession)) {
-        els.sessionSelect.value = state.selectedSession;
+      // Decide what to select:
+      //   1. If previous selection still exists, keep it
+      //   2. Else if there's an active monitor, auto-select the first one
+      //   3. Else clear selection
+      let toSelect = null;
+      if (prevSelected && state.monitors.find(m => m.session_id === prevSelected)) {
+        toSelect = prevSelected;
+      } else if (active.length > 0) {
+        toSelect = active[0].session_id;
+      }
+
+      if (toSelect) {
+        els.sessionSelect.value = toSelect;
+        // Only call selectMonitor if it's a different session (avoids re-polling same)
+        if (state.selectedSession !== toSelect) {
+          selectMonitor(toSelect);
+        }
       } else {
         els.sessionSelect.value = '';
         state.selectedSession = null;
@@ -488,22 +535,17 @@
       if (state.paused || !state.selectedMonitor || !state.selectedMonitor.monitor_alive) return;
 
       const m = state.selectedMonitor;
-      // Convert absolute out_path to /files/ URL relative to SHARED_DIR
-      // The FileVault /files/* route serves files from SHARED_DIR
-      // We need to use a relative path. Use the out_path as-is if it's inside SHARED_DIR.
-      // For simplicity, assume out_path is /home/z/.../shared/... → extract relative
       const sharedMarker = '/shared/';
       let relPath;
       const idx = m.out_path.indexOf(sharedMarker);
       if (idx >= 0) {
         relPath = m.out_path.substring(idx + sharedMarker.length);
       } else {
-        // Fallback: use basename
         relPath = m.out_path.split('/').pop();
       }
 
       try {
-        // HEAD request to check Last-Modified
+        // HEAD request to check Last-Modified — token via header
         const headRes = await fetch(buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`), {
           method: 'HEAD',
           headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
@@ -520,9 +562,8 @@
 
         if (mtime !== state.lastImgMtime) {
           state.lastImgMtime = mtime;
-          // Cache-bust and reload
-          els.liveImg.src = buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { t: Date.now() });
-          // Refresh status bar
+          // For <img src>, we need the token in URL — use buildAuthedUrl
+          els.liveImg.src = buildAuthedUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { t: Date.now() });
           await refreshStatus();
         }
       } catch (e) {
@@ -564,11 +605,6 @@
       state.listPollTimer = setInterval(refreshMonitors, 10000);
     }
 
-    function stopPolling() {
-      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
-      if (state.listPollTimer) { clearInterval(state.listPollTimer); state.listPollTimer = null; }
-    }
-
     // Event handlers
     els.sessionSelect.onchange = (e) => {
       selectMonitor(e.target.value);
@@ -603,7 +639,8 @@
         } else {
           relPath = state.selectedMonitor.out_path.split('/').pop();
         }
-        window.open(buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { inline: '1' }), '_blank');
+        // For window.open(), we need token in URL
+        window.open(buildAuthedUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { inline: '1' }), '_blank');
       }
     };
 
@@ -620,8 +657,8 @@
         const data = await res.json();
         if (data.status === 'ok') {
           showBanner(`Monitor parado. ${data.stopped?.length || 0} encerrado(s).`);
+          state.selectedSession = null;  // force re-selection on next refresh
           await refreshMonitors();
-          selectMonitor('');
         } else {
           showBanner(`Erro: ${data.error || data.message}`, true);
         }
@@ -632,6 +669,14 @@
       }
     };
 
+    if (els.logoutBtn) {
+      els.logoutBtn.onclick = () => {
+        if (!confirm('Sair vai limpar o token salvo no navegador. Continuar?')) return;
+        clearAuthToken();
+        window.location.href = '/';
+      };
+    }
+
     // Relative time updater
     setInterval(() => {
       if (state.selectedMonitor) {
@@ -639,13 +684,13 @@
       }
     }, 5000);
 
-    // Initial load
+    // Initial load — auto-select first active monitor happens in renderSessionSelect
     refreshMonitors().then(() => {
       startPolling();
     });
 
-    // Back button keeps token
-    els['back-btn'].href = buildUrl('/');
+    // Back button — no token in URL (FileVault reads from localStorage)
+    document.querySelector('.back-btn').href = '/';
   </script>
 </body>
 </html>

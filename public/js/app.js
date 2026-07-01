@@ -3,7 +3,7 @@
 // Inicializa todos os componentes e ativa polling + keyboard
 // ============================================================
 
-import { store, getInitialPath } from './state.js';
+import { store, getInitialPath, getAuthToken, clearAuthToken } from './state.js';
 import { api } from './api.js';
 import { isMobile, isDesktop, showToast } from './utils.js';
 import { initSortHeaders, loadFiles, navigatePath, clearSelection } from './components/browser.js';
@@ -133,6 +133,7 @@ function initActionDispatcher() {
       'clear-selection': clearSelection,
       'hide-upload-list': hideUploadList,
       'toggle-chunks': toggleChunks,
+      'logout': logout,
     };
     if (actions[action]) actions[action]();
   });
@@ -147,6 +148,13 @@ function toggleChunks() {
     btn.textContent = next ? '👁 chunks' : '👁‍🗨 chunks';
   }
   loadFiles();
+}
+
+function logout() {
+  if (!confirm('Sair vai limpar o token salvo no navegador. Você precisará reautenticar. Continuar?')) return;
+  clearAuthToken();
+  showToast('Token removido. Recarregando...', 'info');
+  setTimeout(() => window.location.reload(), 800);
 }
 
 function toggleSidebar() {
@@ -233,14 +241,13 @@ function bootstrap() {
   startPolling();
 }
 
-// Live View button — opens /live?token=...
+// Live View button — opens /live (no token in URL; live.html reads from localStorage)
 function initLiveViewButton() {
   const btn = document.getElementById('live-view-btn');
   if (!btn) return;
-  const token = (typeof getAuthToken === 'function') ? getAuthToken() : '';
-  const url = new URL('/live', window.location.origin);
-  if (token) url.searchParams.set('token', token);
-  btn.href = url.toString();
+  // Simple href="/live" — token comes from localStorage on the live.html side.
+  // No need to set ?token=... in the URL anymore.
+  btn.href = '/live';
 }
 
 // Run on DOM ready

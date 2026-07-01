@@ -5,11 +5,16 @@
 
 import { getAuthToken } from './state.js';
 
-const TOKEN = getAuthToken();
+// Read fresh from storage on each call (token may have been cleared)
+function currentToken() {
+  return getAuthToken();
+}
 
 function buildUrl(path, params = {}) {
   const url = new URL(path, window.location.origin);
-  if (TOKEN) url.searchParams.set('token', TOKEN);
+  // Token is NEVER put in the URL anymore — it's always sent via
+  // Authorization header. This avoids token leakage in browser history,
+  // shared links, screenshots, etc.
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, v);
   }
@@ -18,8 +23,26 @@ function buildUrl(path, params = {}) {
 
 function buildHeaders(extra = {}) {
   const h = { ...extra };
-  if (TOKEN && !h.Authorization) h.Authorization = `Bearer ${TOKEN}`;
+  const token = currentToken();
+  if (token && !h.Authorization) h.Authorization = `Bearer ${token}`;
   return h;
+}
+
+/**
+ * Build a URL that includes the token as a query param.
+ * Used ONLY for resources loaded via <a href> / <img src> / window.open()
+ * where we can't set the Authorization header. The token still appears in
+ * the URL but only for these specific resource fetches, not for page
+ * navigation.
+ */
+function buildAuthedUrl(path, params = {}) {
+  const url = new URL(path, window.location.origin);
+  const token = currentToken();
+  if (token) url.searchParams.set('token', token);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, v);
+  }
+  return url.toString();
 }
 
 async function request(path, options = {}, params = {}) {
@@ -134,33 +157,32 @@ export const api = {
   chunkCancel: (uploadId) =>
     request('/upload/chunk', { method: 'DELETE' }, { uploadId }).then(r => r.json()),
 
-  // ===== Download URLs (não-fetch, para <a download>) =====
-  downloadUrl: (path) => buildUrl(`/files/${encPath(path)}`),
-  inlineUrl: (path) => buildUrl(`/files/${encPath(path)}`, { inline: '1' }),
-  zipUrl: (path) => buildUrl(`/api/zip/${encPath(path)}`),
-  tarUrl: (path) => buildUrl(`/api/tar/${encPath(path)}`),
+  // ===== Download URLs (não-fetch, para <a download>, <img>, window.open) =====
+  // Estes ainda precisam do token na URL porque <a>/<img> não suportam headers.
+  // Mas o token NÃO aparece na barra de endereço — só no network tab.
+  downloadUrl: (path) => buildAuthedUrl(`/files/${encPath(path)}`),
+  inlineUrl: (path) => buildAuthedUrl(`/files/${encPath(path)}`, { inline: '1' }),
+  zipUrl: (path) => buildAuthedUrl(`/api/zip/${encPath(path)}`),
+  tarUrl: (path) => buildAuthedUrl(`/api/tar/${encPath(path)}`),
 };
 
 function encPath(p) {
   return p.split('/').map(encodeURIComponent).join('/');
 }
 
-// Helper pra construir query string com path atual (usado em uploads)
+// Helper pra construir query string (sem token — token vai no header)
 export function getQuery(extra = {}) {
   const params = { ...extra };
-  if (TOKEN) params.token = TOKEN;
-  // path é adicionado via URL da rota nos endpoints específicos
   const s = new URLSearchParams(params).toString();
   return s ? `?${s}` : '';
 }
 
 // Helper pra uploads via XHR que precisam setar o header Authorization manualmente
-// (porque o middleware authenticate SÓ aceita token via query em GET;
-//  POST/DELETE/PATCH exigem header Authorization: Bearer)
 export function authHeader() {
-  return TOKEN ? `Bearer ${TOKEN}` : null;
+  const t = currentToken();
+  return t ? `Bearer ${t}` : null;
 }
 
 export function getAuthTokenValue() {
-  return TOKEN;
+  return currentToken();
 }
