@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a0e14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>FileVault — Self-hosted file transfer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+
+  <!-- ==================== Top Bar ==================== -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">F</div>
+      <span class="brand-name">FileVault</span>
+      <span class="version" id="server-version">v?</span>
+    </div>
+    <div class="search">
+      <span class="icon">🔍</span>
+      <input type="text" id="search-input" placeholder="Buscar (*.txt, *.mp4, IMG*)" autocomplete="off">
+      <div class="search-results" id="search-results"></div>
+    </div>
+    <div class="status-pills">
+      <div class="pill ok" id="pill-conn" title="Tipo de túnel">
+        <span class="dot"></span><span id="conn-type">—</span>
+      </div>
+      <div class="pill ok" id="pill-auth" title="Status de autenticação">
+        <span class="dot"></span><span id="auth-status">—</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button class="icon-btn" data-action="toggle-sidebar" title="Sidebar (Ctrl+B)">☰</button>
+      <button class="icon-btn" data-action="toggle-drawer" title="Detalhes (Ctrl+D)">📋</button>
+      <button class="icon-btn" data-action="refresh" title="Refresh (F5)">⟳</button>
+    </div>
+  </header>
+
+  <!-- ==================== Main ==================== -->
+  <main class="main" id="main">
+
+    <!-- Sidebar: Tree -->
+    <aside class="sidebar" data-panel="tree">
+      <div class="panel-header">
+        <span>Explorer</span>
+        <div class="panel-actions">
+          <button class="icon-btn" data-action="tree-collapse" title="Recolher tudo">⊟</button>
+          <button class="icon-btn" data-action="tree-refresh" title="Atualizar árvore">⟳</button>
+        </div>
+      </div>
+      <div class="tree" id="tree"></div>
+    </aside>
+
+    <!-- Browser -->
+    <section class="browser" data-panel="browser">
+      <nav class="breadcrumbs" id="breadcrumbs"></nav>
+      <div class="toolbar">
+        <button class="btn primary" data-action="upload">⬆ Upload</button>
+        <button class="btn" data-action="new-folder">📁+ Pasta</button>
+        <button class="btn" data-action="new-file">📄+ Arquivo</button>
+        <div class="spacer"></div>
+        <span class="info" id="browser-info">— items</span>
+        <button class="btn ghost sm" data-action="toggle-chunks" title="Mostrar/ocultar pasta .chunks (sessões de upload)">👁 chunks</button>
+        <button class="btn ghost sm" data-action="refresh-files" title="Atualizar">⟳</button>
+      </div>
+      <div class="file-list-wrap" id="file-list-wrap">
+        <table class="file-table" id="file-table">
+          <thead>
+            <tr>
+              <th data-sort="name">Nome <span class="sort"></span></th>
+              <th data-sort="size" class="ta-right">Tamanho <span class="sort"></span></th>
+              <th data-sort="modified">Modificado <span class="sort"></span></th>
+              <th data-sort="type">Tipo <span class="sort"></span></th>
+              <th class="ta-right">Ações</th>
+            </tr>
+          </thead>
+          <tbody id="file-list"></tbody>
+        </table>
+        <div class="empty-state" id="empty-state" style="display:none">
+          <div class="icon">📂</div>
+          <div class="title">Pasta vazia</div>
+          <div>Arraste arquivos ou use Upload</div>
+        </div>
+      </div>
+      <div class="drop-overlay" id="drop-overlay">
+        <div class="icon">⬆</div>
+        <div>Solte para enviar para <span id="drop-path">/</span></div>
+      </div>
+      <input type="file" id="upload-input" multiple style="display:none">
+    </section>
+
+    <!-- Drawer: Details -->
+    <aside class="drawer" data-panel="drawer">
+      <div class="panel-header">
+        <div class="drawer-title" id="drawer-title">
+          <span class="icon">📋</span>
+          <span class="text">Selecione um item</span>
+        </div>
+        <button class="icon-btn" data-action="clear-selection" title="Limpar">✕</button>
+      </div>
+      <div class="drawer-tabs">
+        <button class="drawer-tab active" data-tab="info">Info</button>
+        <button class="drawer-tab" data-tab="content">Conteúdo</button>
+        <button class="drawer-tab" data-tab="hashes">Hashes</button>
+        <button class="drawer-tab" data-tab="stats">Stats</button>
+      </div>
+      <div class="drawer-body" id="drawer-body">
+        <div class="drawer-empty">
+          <div class="icon">👈</div>
+          <div>Clique em um arquivo ou pasta<br>para ver detalhes aqui</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- ==================== Bottom Tabs (mobile only) ==================== -->
+  <nav class="bottom-tabs" id="bottom-tabs">
+    <button class="bottom-tab active" data-tab="tree">
+      <span class="icon">🗂</span><span class="label">Árvore</span>
+    </button>
+    <button class="bottom-tab" data-tab="browser">
+      <span class="icon">📁</span><span class="label">Arquivos</span>
+    </button>
+    <button class="bottom-tab" data-tab="drawer">
+      <span class="icon">📋</span><span class="label">Detalhes</span>
+    </button>
+    <button class="bottom-tab" data-action="more">
+      <span class="icon">⋯</span><span class="label">Mais</span>
+    </button>
+  </nav>
+
+  <!-- ==================== Status Bar ==================== -->
+  <footer class="statusbar">
+    <div class="item"><span class="icon">📁</span><span id="status-pwd">/</span></div>
+    <div class="item"><span class="icon">∑</span><span id="status-count">0 items</span></div>
+    <div class="item"><span class="icon">⚖</span><span id="status-size">0 B</span></div>
+    <div class="spacer"></div>
+    <div class="item">
+      <span class="icon">💾</span>
+      <span id="status-disk">— / —</span>
+      <div class="disk-bar"><div class="fill" id="disk-fill" style="width:0%"></div></div>
+    </div>
+    <div class="item"><span id="status-tunnel">—</span></div>
+  </footer>
+
+  <!-- ==================== Modals ==================== -->
+  <div class="modal-backdrop" id="modal-backdrop">
+    <div class="modal" id="modal"></div>
+  </div>
+
+  <!-- ==================== Context Menu ==================== -->
+  <div class="context-menu" id="context-menu"></div>
+
+  <!-- ==================== Toasts ==================== -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- ==================== Upload Progress ==================== -->
+  <div class="upload-list" id="upload-list">
+    <div class="upload-list-header">
+      <span>Uploads (<span id="upload-count">0</span>)</span>
+      <button class="icon-btn" data-action="hide-upload-list">✕</button>
+    </div>
+    <div class="upload-list-body" id="upload-list-body"></div>
+  </div>
+
+  <!-- ==================== Mobile Action Sheet ==================== -->
+  <div class="action-sheet" id="action-sheet">
+    <div class="action-sheet-handle"></div>
+    <div class="action-sheet-title">Ações</div>
+    <div class="action-sheet-body" id="action-sheet-body"></div>
+  </div>
+  <div class="action-sheet-backdrop" id="action-sheet-backdrop"></div>
+
+  <!-- ==================== Scripts (loaded as ES modules) ==================== -->
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "name": "filevault",
+  "version": "2.2.0",
+  "description": "Self-hosted file transfer server with chunked uploads, tunnel support, and a glassmorphic web UI.",
+  "main": "server.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Vmarcelo49/FileVault.git"
+  },
+  "homepage": "https://github.com/Vmarcelo49/FileVault",
+  "bugs": {
+    "url": "https://github.com/Vmarcelo49/FileVault/issues"
+  },
+  "author": "Vmarcelo49",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "local": "LOCAL_ONLY=true node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "cloudflared": "^0.7.1",
+    "localtunnel": "^2.0.2",
+    "multer": "^1.4.5-lts.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": false,
+  "keywords": [
+    "file-transfer",
+    "cloudflare-tunnel",
+    "localtunnel",
+    "chunked-upload",
+    "self-hosted",
+    "file-server",
+    "express"
+  ]
+}
