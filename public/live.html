@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FileVault — Live View</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/styles.css">
+  <style>
+    /* Live viewer specific styles */
+    body { background: var(--bg, #0a0e14); color: var(--text, #e2e8f0); font-family: 'Inter', sans-serif; margin: 0; min-height: 100vh; }
+
+    .live-page {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 16px 20px 40px;
+    }
+
+    .live-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border, #1f2937);
+    }
+    .live-header h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .live-header .back-btn {
+      background: var(--surface, #1a1f2e);
+      color: var(--text, #e2e8f0);
+      border: 1px solid var(--border, #2d3748);
+      padding: 6px 12px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    .live-header .back-btn:hover { background: var(--surface-hover, #242b3d); }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .controls select, .controls input, .controls button {
+      background: var(--surface, #1a1f2e);
+      color: var(--text, #e2e8f0);
+      border: 1px solid var(--border, #2d3748);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .controls button {
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .controls button:hover { background: var(--surface-hover, #242b3d); }
+    .controls button.primary {
+      background: var(--accent, #6366f1);
+      border-color: var(--accent, #6366f1);
+      color: #fff;
+    }
+    .controls button.primary:hover { background: #4f46e5; }
+    .controls button.danger {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+    .controls button.danger:hover { background: rgba(239, 68, 68, 0.2); }
+    .controls button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status-bar {
+      background: var(--surface, #1a1f2e);
+      border: 1px solid var(--border, #2d3748);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .status-item { display: flex; align-items: center; gap: 6px; }
+    .status-item .label { color: var(--text-muted, #64748b); }
+    .status-item .value { color: var(--text, #e2e8f0); font-weight: 500; }
+    .status-item .value.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+
+    .live-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .live-indicator.online {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .live-indicator.online .dot {
+      width: 8px;
+      height: 8px;
+      background: #10b981;
+      border-radius: 50%;
+      animation: pulse 1.5s infinite;
+    }
+    .live-indicator.offline {
+      background: rgba(100, 116, 139, 0.15);
+      color: #94a3b8;
+      border: 1px solid rgba(100, 116, 139, 0.3);
+    }
+    .live-indicator.error {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.2); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    .viewer-frame {
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 400px;
+      position: relative;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    .viewer-frame img {
+      max-width: 100%;
+      max-height: 75vh;
+      display: block;
+    }
+    .viewer-frame .placeholder {
+      color: var(--text-muted, #64748b);
+      font-size: 14px;
+      text-align: center;
+      padding: 60px 20px;
+    }
+    .viewer-frame .placeholder .icon {
+      font-size: 48px;
+      margin-bottom: 12px;
+      opacity: 0.5;
+    }
+    .viewer-frame .overlay-msg {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.7);
+      color: #fff;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .banner {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      color: #fbbf24;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    .banner.error {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-muted, #64748b);
+    }
+    .empty-state .icon { font-size: 48px; margin-bottom: 12px; opacity: 0.5; }
+    .empty-state h2 { font-size: 18px; margin: 0 0 8px; color: var(--text, #e2e8f0); }
+    .empty-state p { font-size: 14px; margin: 0 0 20px; }
+    .empty-state code {
+      background: var(--surface, #1a1f2e);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--accent, #6366f1);
+    }
+
+    @media (max-width: 768px) {
+      .live-page { padding: 12px; }
+      .live-header h1 { font-size: 16px; }
+      .status-bar { font-size: 12px; gap: 12px; }
+      .controls { gap: 6px; }
+      .controls button, .controls select { font-size: 12px; padding: 5px 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="live-page">
+    <header class="live-header">
+      <a href="/" class="back-btn" id="back-btn">← FileVault</a>
+      <h1>📺 Live View</h1>
+      <div class="live-indicator offline" id="live-indicator">
+        <span class="dot"></span>
+        <span id="live-status">offline</span>
+      </div>
+    </header>
+
+    <div id="banner" style="display:none"></div>
+
+    <div class="controls">
+      <select id="session-select" title="Selecionar sessão monitorada">
+        <option value="">— nenhum monitor ativo —</option>
+      </select>
+      <button id="refresh-btn" title="Recarregar lista de monitores">⟳ Atualizar</button>
+      <button id="pause-btn" disabled>⏸ Pausar</button>
+      <button id="fullscreen-btn" disabled>⛶ Tela cheia</button>
+      <button id="open-btn" disabled>↗ Abrir imagem</button>
+      <button id="stop-btn" class="danger" disabled>■ Parar monitor</button>
+    </div>
+
+    <div class="status-bar" id="status-bar">
+      <div class="status-item">
+        <span class="label">Sessão:</span>
+        <span class="value mono" id="status-session">—</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Último frame:</span>
+        <span class="value" id="status-last-frame">—</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Frames:</span>
+        <span class="value mono" id="status-frames">0 capturados / 0 skipped</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Intervalo:</span>
+        <span class="value mono" id="status-interval">—</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Tamanho:</span>
+        <span class="value mono" id="status-size">—</span>
+      </div>
+    </div>
+
+    <div class="viewer-frame" id="viewer-frame">
+      <div class="placeholder" id="placeholder">
+        <div class="icon">📺</div>
+        <div>Selecione um monitor ativo acima para visualizar</div>
+      </div>
+      <img id="live-img" style="display:none" alt="Live view">
+      <div class="overlay-msg" id="overlay-msg" style="display:none"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    // ============================================================
+    // live.html — Live viewer for HeadlessLab monitor mode
+    // ============================================================
+    // Polls /api/monitors every 10s to refresh the list of active
+    // monitors. When a monitor is selected, polls the output PNG
+    // via HEAD every 2s; if Last-Modified changed, reloads the img.
+    // ============================================================
+
+    const TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+
+    function buildUrl(path, params = {}) {
+      const url = new URL(path, window.location.origin);
+      if (TOKEN) url.searchParams.set('token', TOKEN);
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, v);
+      }
+      return url.toString();
+    }
+
+    async function api(path, options = {}, params = {}) {
+      const url = buildUrl(path, params);
+      const opts = { ...options };
+      opts.headers = { ...(opts.headers || {}) };
+      if (TOKEN && !opts.headers.Authorization) opts.headers.Authorization = `Bearer ${TOKEN}`;
+      if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof FormData)) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(opts.body);
+      }
+      return fetch(url, opts);
+    }
+
+    // State
+    const state = {
+      monitors: [],
+      selectedSession: null,
+      selectedMonitor: null,
+      paused: false,
+      lastImgMtime: null,
+      pollTimer: null,
+      listPollTimer: null,
+    };
+
+    // DOM
+    const $ = id => document.getElementById(id);
+    const els = {
+      indicator: $('live-indicator'),
+      indicatorStatus: $('live-status'),
+      banner: $('banner'),
+      sessionSelect: $('session-select'),
+      refreshBtn: $('refresh-btn'),
+      pauseBtn: $('pause-btn'),
+      fullscreenBtn: $('fullscreen-btn'),
+      openBtn: $('open-btn'),
+      stopBtn: $('stop-btn'),
+      statusSession: $('status-session'),
+      statusLastFrame: $('status-last-frame'),
+      statusFrames: $('status-frames'),
+      statusInterval: $('status-interval'),
+      statusSize: $('status-size'),
+      viewerFrame: $('viewer-frame'),
+      placeholder: $('placeholder'),
+      liveImg: $('live-img'),
+      overlayMsg: $('overlay-msg'),
+    };
+
+    function setIndicator(state, label) {
+      els.indicator.className = `live-indicator ${state}`;
+      els.indicatorStatus.textContent = label;
+    }
+
+    function showBanner(msg, isError = false) {
+      els.banner.textContent = msg;
+      els.banner.className = isError ? 'banner error' : 'banner';
+      els.banner.style.display = msg ? 'block' : 'none';
+    }
+
+    function formatRelative(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      const diffMs = Date.now() - d.getTime();
+      const diffS = Math.floor(diffMs / 1000);
+      if (diffS < 5) return 'agora mesmo';
+      if (diffS < 60) return `há ${diffS}s`;
+      const diffMin = Math.floor(diffS / 60);
+      if (diffMin < 60) return `há ${diffMin}min`;
+      const diffH = Math.floor(diffMin / 60);
+      if (diffH < 24) return `há ${diffH}h`;
+      return d.toLocaleString('pt-BR');
+    }
+
+    function formatAge(ms) {
+      if (ms == null) return '—';
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return `${s}s atrás`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}min atrás`;
+      const h = Math.floor(m / 60);
+      return `${h}h atrás`;
+    }
+
+    // Poll monitors list
+    async function refreshMonitors() {
+      try {
+        const res = await api('/api/monitors');
+        const data = await res.json();
+        if (data.status === 'error') {
+          showBanner(`Erro: ${data.error}`, true);
+          return;
+        }
+        if (data.headless_available === false) {
+          showBanner(`HeadlessLab não disponível: ${data.error}`, true);
+          return;
+        }
+        showBanner('');
+        state.monitors = data.monitors || [];
+        renderSessionSelect();
+      } catch (e) {
+        showBanner(`Falha ao buscar monitores: ${e.message}`, true);
+      }
+    }
+
+    function renderSessionSelect() {
+      const active = state.monitors.filter(m => m.monitor_alive);
+      const inactive = state.monitors.filter(m => !m.monitor_alive);
+
+      els.sessionSelect.innerHTML = '';
+
+      if (active.length === 0 && inactive.length === 0) {
+        els.sessionSelect.innerHTML = '<option value="">— nenhum monitor ativo —</option>';
+        return;
+      }
+
+      if (active.length > 0) {
+        const grp = document.createElement('optgroup');
+        grp.label = `🟢 Ativos (${active.length})`;
+        for (const m of active) {
+          const opt = document.createElement('option');
+          opt.value = m.session_id;
+          opt.textContent = `${m.session_id} — ${m.out_path?.split('/').pop() || '?'}`;
+          grp.appendChild(opt);
+        }
+        els.sessionSelect.appendChild(grp);
+      }
+
+      if (inactive.length > 0) {
+        const grp = document.createElement('optgroup');
+        grp.label = `⏹ Inativos (${inactive.length})`;
+        for (const m of inactive.slice(0, 10)) {
+          const opt = document.createElement('option');
+          opt.value = m.session_id;
+          opt.textContent = `${m.session_id} [${m.status}]`;
+          grp.appendChild(opt);
+        }
+        els.sessionSelect.appendChild(grp);
+      }
+
+      // Preserve selection if still present
+      if (state.selectedSession && state.monitors.find(m => m.session_id === state.selectedSession)) {
+        els.sessionSelect.value = state.selectedSession;
+      } else {
+        els.sessionSelect.value = '';
+        state.selectedSession = null;
+        state.selectedMonitor = null;
+        showPlaceholder('Selecione um monitor ativo acima');
+      }
+    }
+
+    function showPlaceholder(msg) {
+      els.liveImg.style.display = 'none';
+      els.placeholder.style.display = 'block';
+      els.placeholder.innerHTML = `<div class="icon">📺</div><div>${msg}</div>`;
+      els.pauseBtn.disabled = true;
+      els.fullscreenBtn.disabled = true;
+      els.openBtn.disabled = true;
+      els.stopBtn.disabled = true;
+      setIndicator('offline', 'sem monitor');
+    }
+
+    function selectMonitor(sessionId) {
+      state.selectedSession = sessionId;
+      state.selectedMonitor = state.monitors.find(m => m.session_id === sessionId);
+      state.lastImgMtime = null;
+
+      if (!state.selectedMonitor) {
+        showPlaceholder('Monitor não encontrado');
+        return;
+      }
+
+      if (!state.selectedMonitor.monitor_alive) {
+        showPlaceholder(`Monitor ${sessionId} não está ativo (status: ${state.selectedMonitor.status})`);
+        setIndicator('offline', state.selectedMonitor.status || 'inativo');
+        return;
+      }
+
+      // Start polling the image
+      els.placeholder.style.display = 'none';
+      els.liveImg.style.display = 'block';
+      els.pauseBtn.disabled = false;
+      els.fullscreenBtn.disabled = false;
+      els.openBtn.disabled = false;
+      els.stopBtn.disabled = false;
+      setIndicator('online', 'ao vivo');
+
+      // Trigger first poll immediately
+      pollImage();
+    }
+
+    async function pollImage() {
+      if (state.paused || !state.selectedMonitor || !state.selectedMonitor.monitor_alive) return;
+
+      const m = state.selectedMonitor;
+      // Convert absolute out_path to /files/ URL relative to SHARED_DIR
+      // The FileVault /files/* route serves files from SHARED_DIR
+      // We need to use a relative path. Use the out_path as-is if it's inside SHARED_DIR.
+      // For simplicity, assume out_path is /home/z/.../shared/... → extract relative
+      const sharedMarker = '/shared/';
+      let relPath;
+      const idx = m.out_path.indexOf(sharedMarker);
+      if (idx >= 0) {
+        relPath = m.out_path.substring(idx + sharedMarker.length);
+      } else {
+        // Fallback: use basename
+        relPath = m.out_path.split('/').pop();
+      }
+
+      try {
+        // HEAD request to check Last-Modified
+        const headRes = await fetch(buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`), {
+          method: 'HEAD',
+          headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
+        });
+
+        if (!headRes.ok) {
+          els.overlayMsg.textContent = `Arquivo não encontrado (${headRes.status})`;
+          els.overlayMsg.style.display = 'block';
+          return;
+        }
+
+        const mtime = headRes.headers.get('Last-Modified');
+        els.overlayMsg.style.display = 'none';
+
+        if (mtime !== state.lastImgMtime) {
+          state.lastImgMtime = mtime;
+          // Cache-bust and reload
+          els.liveImg.src = buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { t: Date.now() });
+          // Refresh status bar
+          await refreshStatus();
+        }
+      } catch (e) {
+        els.overlayMsg.textContent = `Erro: ${e.message}`;
+        els.overlayMsg.style.display = 'block';
+      }
+    }
+
+    async function refreshStatus() {
+      if (!state.selectedSession) return;
+      try {
+        const res = await api('/api/monitors');
+        const data = await res.json();
+        const m = (data.monitors || []).find(x => x.session_id === state.selectedSession);
+        if (!m) return;
+        state.selectedMonitor = m;
+
+        els.statusSession.textContent = m.session_id;
+        els.statusLastFrame.textContent = formatRelative(m.last_frame_at);
+        els.statusFrames.textContent = `${m.frames_captured} capturados / ${m.frames_skipped} skipped`;
+        els.statusInterval.textContent = m.interval_s ? `${m.interval_s}s` : '—';
+        els.statusSize.textContent = m.out_size_formatted || '—';
+
+        if (!m.monitor_alive) {
+          setIndicator('error', m.status || 'morreu');
+          els.pauseBtn.disabled = true;
+          els.stopBtn.disabled = true;
+          showBanner(`Monitor ${m.session_id} saiu do ar (status: ${m.status})`, true);
+        }
+      } catch (e) {
+        // silent
+      }
+    }
+
+    function startPolling() {
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      state.pollTimer = setInterval(pollImage, 2000);
+      if (state.listPollTimer) clearInterval(state.listPollTimer);
+      state.listPollTimer = setInterval(refreshMonitors, 10000);
+    }
+
+    function stopPolling() {
+      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+      if (state.listPollTimer) { clearInterval(state.listPollTimer); state.listPollTimer = null; }
+    }
+
+    // Event handlers
+    els.sessionSelect.onchange = (e) => {
+      selectMonitor(e.target.value);
+    };
+
+    els.refreshBtn.onclick = refreshMonitors;
+
+    els.pauseBtn.onclick = () => {
+      state.paused = !state.paused;
+      els.pauseBtn.textContent = state.paused ? '⏯ Retomar' : '⏸ Pausar';
+      if (state.paused) {
+        setIndicator('offline', 'pausado');
+      } else if (state.selectedMonitor?.monitor_alive) {
+        setIndicator('online', 'ao vivo');
+        pollImage();
+      }
+    };
+
+    els.fullscreenBtn.onclick = () => {
+      if (els.liveImg.requestFullscreen) {
+        els.liveImg.requestFullscreen();
+      }
+    };
+
+    els.openBtn.onclick = () => {
+      if (state.selectedMonitor) {
+        const sharedMarker = '/shared/';
+        let relPath;
+        const idx = state.selectedMonitor.out_path.indexOf(sharedMarker);
+        if (idx >= 0) {
+          relPath = state.selectedMonitor.out_path.substring(idx + sharedMarker.length);
+        } else {
+          relPath = state.selectedMonitor.out_path.split('/').pop();
+        }
+        window.open(buildUrl(`/files/${relPath.split('/').map(encodeURIComponent).join('/')}`, { inline: '1' }), '_blank');
+      }
+    };
+
+    els.stopBtn.onclick = async () => {
+      if (!state.selectedSession) return;
+      if (!confirm(`Parar monitor da sessão ${state.selectedSession}?`)) return;
+      try {
+        els.stopBtn.disabled = true;
+        els.stopBtn.textContent = 'Parando...';
+        const res = await api('/api/monitors/stop', {
+          method: 'POST',
+          body: { session_id: state.selectedSession }
+        });
+        const data = await res.json();
+        if (data.status === 'ok') {
+          showBanner(`Monitor parado. ${data.stopped?.length || 0} encerrado(s).`);
+          await refreshMonitors();
+          selectMonitor('');
+        } else {
+          showBanner(`Erro: ${data.error || data.message}`, true);
+        }
+      } catch (e) {
+        showBanner(`Erro: ${e.message}`, true);
+      } finally {
+        els.stopBtn.textContent = '■ Parar monitor';
+      }
+    };
+
+    // Relative time updater
+    setInterval(() => {
+      if (state.selectedMonitor) {
+        els.statusLastFrame.textContent = formatRelative(state.selectedMonitor.last_frame_at);
+      }
+    }, 5000);
+
+    // Initial load
+    refreshMonitors().then(() => {
+      startPolling();
+    });
+
+    // Back button keeps token
+    els['back-btn'].href = buildUrl('/');
+  </script>
+</body>
+</html>

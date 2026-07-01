@@ -219,6 +219,7 @@ function bootstrap() {
   initSearch();
   initActionDispatcher();
   initKeyboard();
+  initLiveViewButton();
 
   // Mobile inicialização
   if (!isDesktop()) {
@@ -230,6 +231,16 @@ function bootstrap() {
   // Carga inicial
   refreshAll();
   startPolling();
+}
+
+// Live View button — opens /live?token=...
+function initLiveViewButton() {
+  const btn = document.getElementById('live-view-btn');
+  if (!btn) return;
+  const token = (typeof getAuthToken === 'function') ? getAuthToken() : '';
+  const url = new URL('/live', window.location.origin);
+  if (token) url.searchParams.set('token', token);
+  btn.href = url.toString();
 }
 
 // Run on DOM ready

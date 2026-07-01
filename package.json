@@ -1,6 +1,6 @@
 {
   "name": "filevault",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Self-hosted file transfer server with chunked uploads, tunnel support, and a glassmorphic web UI.",
   "main": "server.js",
   "repository": {

@@ -182,7 +182,62 @@ FileVault/
 - Path traversal is validated on every route.
 - Rate limiting: 100 req/min/IP on `/api/*` and `/upload/*` (configurable).
 
+## 📺 Live View (optional — requires HeadlessLab)
+
+FileVault integrates with [HeadlessLab](https://github.com/Vmarcelo49/HeadlessLab) to provide a live screen monitor for Windows apps running under Wine.
+
+### How it works
+
+1. **Agent spawns a Wine session** via HeadlessLab: `headless exec --display :101 --wait app.exe`
+2. **Agent starts a monitor** for that session: `headless monitor start --session SESS --out /path/to/shared/live.png --interval 5s`
+3. **User opens Live View** in FileVault (📺 button on topbar) — sees the screen update every 5s
+
+The monitor is **opt-in** — it must be explicitly started by the agent. It never runs automatically, to preserve host resources (CPU, I/O). When the Wine session dies, the monitor self-terminates with `status=session_gone`.
+
+### Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `HEADLESS_BIN` | `/home/z/bin/headless` | Path to the `headless` CLI binary |
+| `HEADLESS_MONITOR_ENABLED` | `true` | Set to `false` to disable the feature entirely |
+
+### API endpoints
+
+```bash
+# List all monitors (cached 2s)
+curl -H "Authorization: Bearer $TOK" "$URL/api/monitors"
+
+# Start a monitor (out_path must be inside SHARED_DIR)
+curl -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+  -d '{"session_id":"sess_...","out_path":"live.png","interval":"5s"}' \
+  "$URL/api/monitors/start"
+
+# Stop a monitor (or all if no session_id)
+curl -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+  -d '{"session_id":"sess_..."}' \
+  "$URL/api/monitors/stop"
+```
+
+### Web UI
+
+Click the 📺 button in the FileVault topbar (or visit `/live?token=...`) to open the live viewer. Features:
+
+- **Session selector** — switch between active monitors
+- **Polling HEAD requests** — reloads image only when `Last-Modified` changes (no flicker)
+- **Live indicator** — pulsing green dot when monitor is active
+- **Pause/Resume** — stop polling temporarily
+- **Fullscreen** — open the image in fullscreen
+- **Stop monitor** — kill the monitor subprocess from the UI
+
 ## 📝 Changelog
+
+### v2.3.0
+- **Feat**: Live View — new `/live` page that monitors a HeadlessLab session's screen in real-time (polls every 2s, updates only on change).
+- **Feat**: `GET /api/monitors` — list active HeadlessLab monitors (cached 2s).
+- **Feat**: `POST /api/monitors/start` — start a monitor for a session (validates that `out_path` is inside `SHARED_DIR`).
+- **Feat**: `POST /api/monitors/stop` — stop one or all monitors.
+- **Feat**: 📺 button on FileVault topbar that opens the live viewer.
+- **Feat**: Optional HeadlessLab integration (controlled by `HEADLESS_BIN` and `HEADLESS_MONITOR_ENABLED` env vars).
 
 ### v2.2.0
 - **Fix**: chunked uploads from the browser now send `Authorization: Bearer` header (previously only `?token=` in query, which the server rejects on POST). This was the root cause of chunked uploads failing silently with 0/N chunks received.
