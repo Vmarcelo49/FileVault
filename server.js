@@ -243,10 +243,13 @@ app.use((req, res, next) => {
 // ============================================================
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Idempotent');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, HEAD');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Idempotent, Depth, Destination, Overwrite, Timeout, Lock-Token, If');
   res.setHeader('Access-Control-Max-Age', '86400');
-  if (req.method === 'OPTIONS') {
+  // Don't intercept OPTIONS for WebDAV paths — the WebDAV router needs to
+  // respond with `DAV: 1, 2` headers so clients like Dolphin detect support.
+  const isWebDAVPath = req.path.startsWith('/webdav') || req.path.startsWith('/dav');
+  if (req.method === 'OPTIONS' && !isWebDAVPath) {
     return res.status(204).end();
   }
   next();
@@ -324,10 +327,24 @@ const authenticate = (req, res, next) => {
     clientToken = req.query.token;
   }
 
-  // All methods: Authorization header
+  // All methods: Authorization header (Bearer or Basic)
   if (!clientToken && req.headers.authorization) {
     const parts = req.headers.authorization.split(' ');
-    if (parts[0] === 'Bearer') clientToken = parts[1];
+    if (parts[0] === 'Bearer') {
+      clientToken = parts[1];
+    } else if (parts[0] === 'Basic') {
+      // WebDAV clients (Dolphin, Finder, Windows Explorer, Nautilus) only
+      // support Basic/Digest auth — not Bearer. We accept Basic auth where
+      // the username is ignored and the password carries the AUTH_TOKEN.
+      // This keeps a single source of truth for credentials.
+      try {
+        const decoded = Buffer.from(parts[1], 'base64').toString('utf8');
+        const idx = decoded.indexOf(':');
+        if (idx >= 0) {
+          clientToken = decoded.substring(idx + 1);
+        }
+      } catch (e) { /* invalid base64 — fall through to 401 */ }
+    }
   }
 
   if (clientToken === token) return next();
@@ -1930,10 +1947,29 @@ app.delete('/files/*', authenticate, (req, res) => {
 });
 
 // ============================================================
+// WebDAV server — mount at /webdav (alias /dav) for Dolphin,
+// Finder, Windows Explorer, Nautilus, and other WebDAV clients.
+// Uses the same AUTH_TOKEN (Basic Auth: username ignored,
+// password = AUTH_TOKEN). Reuses getSafePath for path traversal
+// and blocklist protection.
+// ============================================================
+const createWebDAVRouter = require('./webdav');
+const webdavRouter = createWebDAVRouter({
+  SHARED_DIR,
+  getSafePath,
+  authenticate,
+  log,
+  BLOCKLIST,
+});
+app.use('/webdav', webdavRouter);
+app.use('/dav', webdavRouter);  // alias for shorter URLs
+
+// ============================================================
 // Start server + tunnels
 // ============================================================
 const server = app.listen(PORT, '0.0.0.0', () => {
   log.info(`Server listening on port ${PORT}`, { sharedDir: SHARED_DIR });
+  log.info(`WebDAV endpoint active`, { mount: '/webdav', alias: '/dav' });
   log.info(`Chunked upload config`, {
     chunkSize: formatBytes(CHUNK_SIZE),
     maxTotalSize: formatBytes(MAX_TOTAL_SIZE),
