@@ -41,7 +41,7 @@ export function openNewFolderModal() {
     <div class="form-group">
       <label>Nome da pasta</label>
       <input type="text" id="modal-folder-name" placeholder="ex: documentos" autofocus>
-      <div class="hint">Será criada em: /${basePath || 'root'}</div>
+      <div class="hint">Será criada em: /${escapeHtml(basePath || 'root')}</div>
     </div>
   `, `
     <button class="btn" data-act="cancel">Cancelar</button>
@@ -86,7 +86,7 @@ export function openNewFileModal() {
     <div class="form-group">
       <label>Nome do arquivo</label>
       <input type="text" id="modal-file-name" placeholder="ex: notas.txt">
-      <div class="hint">Será criado em: /${basePath || 'root'}</div>
+      <div class="hint">Será criado em: /${escapeHtml(basePath || 'root')}</div>
     </div>
     <div class="form-group">
       <label>Conteúdo (opcional)</label>
