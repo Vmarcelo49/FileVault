@@ -38,6 +38,22 @@ module.exports = function createWebDAVRouter(opts) {
   const router = express.Router();
 
   // ============================================================
+  // Logging control
+  //
+  // PER-FIX: Dolphin (and other WebDAV clients) issue 1 PROPFIND Depth:1
+  // plus N PROPFIND Depth:0 per child (one per item) on every folder open.
+  // For a folder with 50 items that's 51 requests; logging every one of
+  // them with a full JSON blob flooded the log (thousands of lines per
+  // minute) and added sync I/O to the hot path. WebDAV request logging is
+  // now opt-in via the WEBDAV_VERBOSE_LOG env var.
+  // ============================================================
+  const WEBDAV_VERBOSE_LOG = process.env.WEBDAV_VERBOSE_LOG === '1'
+    || process.env.WEBDAV_VERBOSE_LOG === 'true';
+  function webdavLog(msg, extra) {
+    if (WEBDAV_VERBOSE_LOG) log.info(msg, extra);
+  }
+
+  // ============================================================
   // Helpers
   // ============================================================
 
@@ -164,25 +180,50 @@ ${prop}      </D:prop>
   }
 
   /**
+   * Read directory entries with one syscall instead of readdirSync +
+   * N×statSync. Uses withFileTypes to get the type from the dirent.
+   * Falls back to statSync only when dirent.isFile()/isDirectory() are
+   * unavailable (rare; happens on some network FS).
+   */
+  function readDirEntries(absPath) {
+    let dirents;
+    try {
+      dirents = fs.readdirSync(absPath, { withFileTypes: true });
+    } catch (e) {
+      return [];
+    }
+    const out = [];
+    for (const d of dirents) {
+      if (BLOCKLIST.has(d.name)) continue;
+      let isDir;
+      try {
+        isDir = d.isDirectory();
+      } catch (e) {
+        // Fallback for FS without dirent type info
+        try { isDir = fs.statSync(path.join(absPath, d.name)).isDirectory(); }
+        catch (e2) { continue; }
+      }
+      out.push({ name: d.name, isDir });
+    }
+    return out;
+  }
+
+  /**
    * Walk a directory recursively (capped at maxDepth) collecting entries.
-   * Skips BLOCKLIST names.
+   * Skips BLOCKLIST names. Uses withFileTypes to avoid stat-per-child.
    */
   function walkRecursive(relPath, absPath, entries, depth, maxDepth) {
     if (depth > maxDepth) return;
-    try {
-      const names = fs.readdirSync(absPath);
-      for (const name of names) {
-        if (BLOCKLIST.has(name)) continue;
-        const childAbs = path.join(absPath, name);
-        const childRel = relPath ? `${relPath}/${name}` : name;
-        try {
-          const childStat = fs.statSync(childAbs);
-          const childIsDir = childStat.isDirectory();
-          entries.push({ relPath: childRel, stat: childStat, isDir: childIsDir });
-          if (childIsDir) walkRecursive(childRel, childAbs, entries, depth + 1, maxDepth);
-        } catch (e) { /* file deleted concurrently */ }
-      }
-    } catch (e) { /* permission error or similar */ }
+    const children = readDirEntries(absPath);
+    for (const { name, isDir } of children) {
+      const childAbs = path.join(absPath, name);
+      const childRel = relPath ? `${relPath}/${name}` : name;
+      try {
+        const childStat = fs.statSync(childAbs);
+        entries.push({ relPath: childRel, stat: childStat, isDir });
+        if (isDir) walkRecursive(childRel, childAbs, entries, depth + 1, maxDepth);
+      } catch (e) { /* file deleted concurrently */ }
+    }
   }
 
   /**
@@ -222,23 +263,31 @@ ${prop}      </D:prop>
   router.use('/*', (req, res, next) => {
     // Strip trailing slash for path resolution (we re-add it for dirs in hrefs)
     const relPath = (req.params[0] || '').replace(/\/+$/, '');
-    const safePath = getSafePath(relPath);
+    // FIX: getSafePath('') returns null, but the WebDAV root collection
+    // (PROPFIND on /webdav/ with empty relPath) must resolve to SHARED_DIR.
+    // Without this, Dolphin (and any WebDAV client listing the root) gets a
+    // 404 and cannot open the folder at all.
+    const safePath = relPath === '' ? SHARED_DIR : getSafePath(relPath);
 
-    // Compute the WebDAV base URL once: it's the prefix that was stripped by
-    // Express when mounting the router. req.baseUrl gives us that, but when
-    // the router is mounted at multiple paths (/webdav and /dav), we need to
-    // use the actual matched mount point — req.baseUrl is correct here.
-    // We pass it through req.webdavBaseUrl so handlers don't have to recompute.
-    req.webdavBaseUrl = req.baseUrl || '/webdav';
+    // Compute the WebDAV base URL once.
+    // FIX: req.baseUrl is unreliable when the SAME router instance is mounted
+    // at multiple paths (here: /webdav and /dav). For a request like
+    // PROPFIND /webdav/FileVault/, Express can set req.baseUrl to
+    // '/webdav/FileVault' instead of '/webdav', which causes buildHref to
+    // double the parent folder name (e.g. /webdav/FileVault/FileVault/...) —
+    // exactly the "duplicate folder" bug users see in Dolphin.
+    // We derive the mount prefix from req.originalUrl instead, which is
+    // always the full URL path Express received.
+    const fullPath = (req.originalUrl || '').split('?')[0];
+    const mountPrefix = fullPath.startsWith('/webdav') ? '/webdav'
+                      : fullPath.startsWith('/dav') ? '/dav'
+                      : (req.baseUrl || '/webdav');
+    req.webdavBaseUrl = mountPrefix;
 
-    log.info('WebDAV request', {
+    webdavLog('WebDAV request', {
       method: req.method,
       originalUrl: req.originalUrl,
-      baseUrl: req.baseUrl,
-      path: req.path,
-      params0: req.params[0],
       relPath,
-      webdavBaseUrl: req.webdavBaseUrl,
     });
 
     switch (req.method) {
@@ -289,23 +338,20 @@ ${prop}      </D:prop>
       if (depth === 'infinity') {
         walkRecursive(relPath, safePath, entries, 0, 20);
       } else {
-        // Depth: 1 — immediate children only
-        try {
-          const names = fs.readdirSync(safePath);
-          for (const name of names) {
-            if (BLOCKLIST.has(name)) continue;
-            const childAbs = path.join(safePath, name);
-            const childRel = relPath ? `${relPath}/${name}` : name;
-            try {
-              const childStat = fs.statSync(childAbs);
-              entries.push({
-                relPath: childRel,
-                stat: childStat,
-                isDir: childStat.isDirectory(),
-              });
-            } catch (e) { /* skip */ }
-          }
-        } catch (e) { /* skip */ }
+        // Depth: 1 — immediate children only.
+        // PERF: uses readDirEntries (readdirSync with withFileTypes) so we
+        // get the type from the dirent in 1 syscall, then 1 statSync per
+        // child to fill size/mtime/etag. Previously this did readdirSync
+        // + 1 statSync per child (2N syscalls); now N+1.
+        const children = readDirEntries(safePath);
+        for (const { name, isDir: childIsDir } of children) {
+          const childAbs = path.join(safePath, name);
+          const childRel = relPath ? `${relPath}/${name}` : name;
+          try {
+            const childStat = fs.statSync(childAbs);
+            entries.push({ relPath: childRel, stat: childStat, isDir: childIsDir });
+          } catch (e) { /* skip */ }
+        }
       }
     }
 
@@ -318,9 +364,17 @@ ${prop}      </D:prop>
 ${responses}
 </D:multistatus>`;
 
+    // PERF: cache headers so Dolphin (and intermediate proxies) can reuse
+    // PROPFIND responses for unchanged resources. The ETag is derived from
+    // the directory's mtime+size, so it changes whenever contents change.
+    // Cache-Control: private because responses are auth-gated.
+    const rootEtag = etagFor(stat);
     res.set({
       'Content-Type': 'application/xml; charset=utf-8',
       'DAV': '1, 2',
+      'ETag': rootEtag,
+      'Last-Modified': stat.mtime.toUTCString(),
+      'Cache-Control': 'private, max-age=60, must-revalidate',
     });
     return res.status(207).send(xml);
   }
