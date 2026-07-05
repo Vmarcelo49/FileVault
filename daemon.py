@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import json
+import shlex
 import signal
 import subprocess
 from pathlib import Path
@@ -84,7 +85,9 @@ def spawn_daemon(name, cmd_args, cwd=None, env_extra=None):
             print(f"❌ Daemon '{name}' already running (PID {old_pid})")
             sys.exit(1)
 
-    cmd_file.write_text(' '.join(cmd_args))
+    # FIX: store the command shlex-quoted so restart can shlex.split it
+    # back safely even when arguments contain spaces.
+    cmd_file.write_text(' '.join(shlex.quote(a) for a in cmd_args))
     meta = {'cwd': cwd or None, 'env_extra': env_extra or {}}
     meta_file.write_text(json.dumps(meta))
 
@@ -289,7 +292,10 @@ def restart_daemon(name):
     if not cmd_file.exists():
         print(f"❌ No previous command recorded for '{name}'")
         return False
-    cmd_args = cmd_file.read_text().split(' ')
+    # FIX: use shlex.split so paths with spaces (e.g. --cwd /home/z/my dir)
+    # survive the round-trip through the .cmd file. Previously a naive
+    # .split(' ') broke on any argument containing a space.
+    cmd_args = shlex.split(cmd_file.read_text())
     meta = {}
     if meta_file.exists():
         try:
@@ -338,7 +344,15 @@ def start_filevault(mode='tunnel'):
             if line.startswith('AUTH_TOKEN='):
                 token_hint = line.split('=', 1)[1].strip()
                 break
-    print(f"🔑 FileVault AUTH_TOKEN: {token_hint[:16]}...{token_hint[-8:] if len(token_hint) > 24 else token_hint}")
+    # FIX: don't print a partial AUTH_TOKEN — even the first 16 + last 8
+    # chars (37% of a 64-char token) is enough to aid brute force.
+    # Show only the last 4 chars so the operator can confirm they're
+    # using the right token without leaking any of it.
+    if token_hint:
+        masked = '****' + token_hint[-4:] if len(token_hint) > 4 else '****'
+    else:
+        masked = '(not set)'
+    print(f"🔑 FileVault AUTH_TOKEN: {masked}")
     print(f"📁 Project: {FILEVAULT_DIR}")
     print(f"🌐 Mode: {'local-only' if mode == 'local' else 'public tunnel'}")
     spawn_daemon('filevault', cmd_args, cwd=str(FILEVAULT_DIR), env_extra=env_extra)

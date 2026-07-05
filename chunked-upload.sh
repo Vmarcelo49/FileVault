@@ -70,7 +70,10 @@ INIT_RESP=$(curl -sS -X POST "${AUTH_ARGS[@]}" \
   -d "{\"uploadId\":\"$UPLOAD_ID\",\"fileName\":\"$FILE_NAME\",\"totalSize\":$FILE_SIZE,\"totalChunks\":$TOTAL_CHUNKS,\"path\":\"$UPLOAD_PATH\"}" \
   "${SERVER_URL}/upload/chunk/init")
 
-if echo "$INIT_RESP" | grep -q '"success":true'; then
+# FIX: parse JSON with python instead of grep — grep -q '"success":true'
+# is brittle and breaks if the server returns the field minified as
+# {"success": true} (with space) or with extra whitespace.
+if echo "$INIT_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('success') else 1)" 2>/dev/null; then
   echo "✅ Session initialized"
 else
   echo "❌ Init failed: $INIT_RESP"
@@ -116,10 +119,11 @@ for ((i = START_CHUNK; i < TOTAL_CHUNKS; i++)); do
 
   rm -f "$CHUNK_FILE"
 
-  if echo "$RESPONSE" | grep -q '"success":true'; then
+  # FIX: parse JSON with python — robust against minified/pretty output
+  if echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('success') else 1)" 2>/dev/null; then
     UPLOADED=$((i+1))
     # Check if finalized
-    if echo "$RESPONSE" | grep -q '"finalized":true'; then
+    if echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('finalized') else 1)" 2>/dev/null; then
       echo ""
       echo ""
       echo "🎉 Upload finalized!"
