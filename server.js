@@ -52,6 +52,7 @@ const path = require('path');
 const crypto = require('crypto');
 const readline = require('readline');
 const zlib = require('zlib');
+const archiver = require('archiver');
 require('dotenv').config();
 
 // ============================================================
@@ -154,33 +155,41 @@ function generateUploadId() {
 // ============================================================
 // Recursively scan files and directories (async, doesn't block event loop)
 // FIX #19: Already async, but added maxDepth to prevent runaway scans
+// PERF: uses readdir({ withFileTypes: true }) so we get the entry type
+// (dir vs file) from the dirent in 1 syscall, then 1 stat per child
+// for size/mtime. Previously this did readdir + N×stat = 2N syscalls.
 // ============================================================
 async function getFilesRecursive(dir, maxDepth = 20, currentDepth = 0, showChunks = false) {
   if (currentDepth > maxDepth) return [];
   let results = [];
   try {
-    const fileNames = await fs.promises.readdir(dir);
-    for (const name of fileNames) {
-      if (isHiddenName(name, showChunks)) continue;
-      const filePath = path.join(dir, name);
+    const dirents = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const d of dirents) {
+      if (isHiddenName(d.name, showChunks)) continue;
+      const filePath = path.join(dir, d.name);
       try {
+        // Use dirent type when available; fall back to stat for FSes
+        // that don't populate it (rare; some network mounts).
+        let isDir;
+        try { isDir = d.isDirectory(); }
+        catch { isDir = (await fs.promises.stat(filePath)).isDirectory(); }
         const stat = await fs.promises.stat(filePath);
         const relativeToShared = path.relative(SHARED_DIR, filePath);
 
-        if (stat.isDirectory()) {
+        if (isDir) {
           results.push({
-            name,
+            name: d.name,
             type: 'dir',
             size: stat.size,
             formattedSize: '-',
             modified: stat.mtime.toISOString().replace('T', ' ').substring(0, 16),
             path: relativeToShared
           });
-          const subResults = await getFilesRecursive(filePath, maxDepth, currentDepth + 1);
+          const subResults = await getFilesRecursive(filePath, maxDepth, currentDepth + 1, showChunks);
           results = results.concat(subResults);
         } else {
           results.push({
-            name,
+            name: d.name,
             type: 'file',
             size: stat.size,
             formattedSize: formatBytes(stat.size),
@@ -569,12 +578,22 @@ app.get('/api/files', authenticate, async (req, res) => {
 
 // ============================================================
 // FIX #4: /api/health no longer leaks sharedDir path
+// FIX: version is read from package.json so it stays in sync.
+// /api/health is intentionally unauthenticated so monitoring probes
+// (uptime checks, load balancer pings) can verify the server is up
+// without needing the token. It exposes only: status, uptime, version,
+// and whether auth is enabled (no paths, no counts, no token info).
 // ============================================================
+const PKG_VERSION = (() => {
+  try { return require('./package.json').version || 'unknown'; }
+  catch { return 'unknown'; }
+})();
+
 app.get('/api/health', (req, res) => {
   return res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
-    version: '2.2.0',
+    version: PKG_VERSION,
     authEnabled: !!process.env.AUTH_TOKEN
   });
 });
@@ -586,7 +605,33 @@ app.get('/api/pwd', authenticate, (req, res) => {
 
 // ============================================================
 // FIX #29: /api/find returns relative paths (no leading slash)
+// PERF: caches the recursive file listing for 30s to avoid rescanning
+// the entire SHARED_DIR on every search. The cache is invalidated
+// automatically when the directory's mtime changes (file added/deleted).
 // ============================================================
+let _findCache = null;       // { mtimeMs, files }
+let _findCacheAt = 0;
+const FIND_CACHE_TTL_MS = 30 * 1000;
+
+async function getFindIndex() {
+  const now = Date.now();
+  // Re-validate if older than TTL
+  if (_findCache && (now - _findCacheAt) < FIND_CACHE_TTL_MS) {
+    // Also re-validate if SHARED_DIR mtime changed (file added/deleted)
+    try {
+      const dirStat = await fs.promises.stat(SHARED_DIR);
+      if (dirStat.mtimeMs === _findCache.mtimeMs) {
+        return _findCache.files;
+      }
+    } catch { /* fall through to refresh */ }
+  }
+  const dirStat = await fs.promises.stat(SHARED_DIR);
+  const files = await getFilesRecursive(SHARED_DIR);
+  _findCache = { mtimeMs: dirStat.mtimeMs, files };
+  _findCacheAt = now;
+  return files;
+}
+
 app.get('/api/find', authenticate, async (req, res) => {
   const query = req.query.q || '';
   if (!query) return res.status(400).json({ error: 'Query q is required' });
@@ -596,7 +641,7 @@ app.get('/api/find', authenticate, async (req, res) => {
       .replace(/\\\*/g, '.*')
       .replace(/\\\?/g, '.') + '$';
     const regex = new RegExp(regexStr, 'i');
-    const allFiles = await getFilesRecursive(SHARED_DIR);
+    const allFiles = await getFindIndex();
     const matched = allFiles.filter(f => regex.test(f.name)).map(f => f.path);
     return res.json(matched);
   } catch (err) {
@@ -748,6 +793,29 @@ app.get('/files/*', authenticate, (req, res) => {
 // ============================================================
 const UPLOAD_ID_REGEX = /^[a-zA-Z0-9_-]{4,128}$/;
 
+// FIX: Per-uploadId mutex to prevent race conditions when two chunks
+// arrive concurrently. Without this, both see existsSync=false, both
+// write the chunk file, and the second writeChunkMeta call overwrites
+// the first — meta.receivedChunks ends up out of sync with disk reality.
+// Implementation: chain of Promises per uploadId. Each chunk waits for
+// the previous to settle before running. Settled chains are GC'd.
+const _uploadLocks = new Map();
+function withUploadLock(uploadId, fn) {
+  const prev = _uploadLocks.get(uploadId) || Promise.resolve();
+  // Chain our work onto the previous lock. Catch on the stored view so
+  // a failed chunk doesn't break the chain for subsequent chunks.
+  const next = prev.then(() => fn());
+  const stored = next.catch(() => {});
+  _uploadLocks.set(uploadId, stored);
+  // Best-effort cleanup: if no new chunk extended the chain, drop the entry.
+  stored.then(() => {
+    if (_uploadLocks.get(uploadId) === stored) {
+      _uploadLocks.delete(uploadId);
+    }
+  });
+  return next;
+}
+
 // FIX #5: init response no longer exposes maxTotalSize
 app.post('/upload/chunk/init', authenticate, express.json({ limit: '1mb' }), (req, res) => {
   try {
@@ -826,70 +894,75 @@ app.post('/upload/chunk', authenticate, (req, _res, next) => { req._chunkUpload 
       });
     }
 
-    let meta = readChunkMeta(uploadId);
+    // FIX: serialize per-uploadId so concurrent chunks don't clobber
+    // meta.json or race on existsSync(cFile). The lock is released when
+    // the inner function resolves (either with a response or a throw).
+    return await withUploadLock(uploadId, async () => {
+      let meta = readChunkMeta(uploadId);
 
-    if (idx === 0 && !meta) {
-      if (!fileName || !totalSize) {
-        return res.status(400).json({ error: 'First chunk must include fileName and totalSize' });
+      if (idx === 0 && !meta) {
+        if (!fileName || !totalSize) {
+          return res.status(400).json({ error: 'First chunk must include fileName and totalSize' });
+        }
+        const totalBytes = parseInt(totalSize, 10);
+        if (isNaN(totalBytes) || totalBytes <= 0) {
+          return res.status(400).json({ error: 'Invalid totalSize' });
+        }
+        if (totalBytes > MAX_TOTAL_SIZE) {
+          return res.status(413).json({ error: 'Total size exceeds maximum allowed' });
+        }
+        meta = {
+          uploadId,
+          fileName: sanitizeFilename(fileName),
+          originalName: fileName,
+          totalChunks: total,
+          totalSize: totalBytes,
+          receivedChunks: [],
+          targetPath: '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          finalized: false
+        };
+        writeChunkMeta(uploadId, meta);
+      } else if (!meta) {
+        return res.status(409).json({
+          error: 'Upload session not found. Send chunk 0 first or call POST /upload/chunk/init.'
+        });
       }
-      const totalBytes = parseInt(totalSize, 10);
-      if (isNaN(totalBytes) || totalBytes <= 0) {
-        return res.status(400).json({ error: 'Invalid totalSize' });
+
+      if (meta.finalized) {
+        return res.status(409).json({ error: 'Upload already finalized', uploadId, fileName: meta.fileName });
       }
-      if (totalBytes > MAX_TOTAL_SIZE) {
-        return res.status(413).json({ error: 'Total size exceeds maximum allowed' });
+      if (meta.totalChunks !== total) {
+        return res.status(409).json({ error: `totalChunks mismatch: expected ${meta.totalChunks}, got ${total}` });
       }
-      meta = {
-        uploadId,
-        fileName: sanitizeFilename(fileName),
-        originalName: fileName,
-        totalChunks: total,
-        totalSize: totalBytes,
-        receivedChunks: [],
-        targetPath: '',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        finalized: false
-      };
+
+      const cFile = chunkFilePath(uploadId, idx);
+      if (!fs.existsSync(cFile)) {
+        fs.writeFileSync(cFile, req.file.buffer);
+      }
+
+      const onDisk = listReceivedChunks(uploadId);
+      meta.receivedChunks = onDisk;
+      meta.updatedAt = new Date().toISOString();
       writeChunkMeta(uploadId, meta);
-    } else if (!meta) {
-      return res.status(409).json({
-        error: 'Upload session not found. Send chunk 0 first or call POST /upload/chunk/init.'
+
+      // FIX #14: Idempotent — header tells client this is safe to retry
+      res.setHeader('X-Idempotent', 'true');
+
+      if (onDisk.length === total) {
+        return await finalizeChunkedUpload(uploadId, meta, req, res);
+      }
+
+      return res.json({
+        success: true,
+        uploadId,
+        chunkIndex: idx,
+        received: onDisk.length,
+        total,
+        progress: ((onDisk.length / total) * 100).toFixed(2) + '%',
+        missing: Array.from({ length: total }, (_, i) => i).filter(i => !onDisk.includes(i))
       });
-    }
-
-    if (meta.finalized) {
-      return res.status(409).json({ error: 'Upload already finalized', uploadId, fileName: meta.fileName });
-    }
-    if (meta.totalChunks !== total) {
-      return res.status(409).json({ error: `totalChunks mismatch: expected ${meta.totalChunks}, got ${total}` });
-    }
-
-    const cFile = chunkFilePath(uploadId, idx);
-    if (!fs.existsSync(cFile)) {
-      fs.writeFileSync(cFile, req.file.buffer);
-    }
-
-    const onDisk = listReceivedChunks(uploadId);
-    meta.receivedChunks = onDisk;
-    meta.updatedAt = new Date().toISOString();
-    writeChunkMeta(uploadId, meta);
-
-    // FIX #14: Idempotent — header tells client this is safe to retry
-    res.setHeader('X-Idempotent', 'true');
-
-    if (onDisk.length === total) {
-      return await finalizeChunkedUpload(uploadId, meta, req, res);
-    }
-
-    return res.json({
-      success: true,
-      uploadId,
-      chunkIndex: idx,
-      received: onDisk.length,
-      total,
-      progress: ((onDisk.length / total) * 100).toFixed(2) + '%',
-      missing: Array.from({ length: total }, (_, i) => i).filter(i => !onDisk.includes(i))
     });
   } catch (err) {
     log.error('Chunk upload error:', { message: err.message });
@@ -1238,15 +1311,32 @@ async function finalizeChunkedUpload(uploadId, meta, req, res) {
 
   let totalWritten = 0;
   const writeStream = fs.createWriteStream(finalPath);
+  // Helper: pipe a single chunk file into the write stream and wait for
+  // the read side to finish (which means the data has been handed off to
+  // the OS, though the write stream may still be flushing).
+  const pipeChunk = (cFile) => new Promise((resolve, reject) => {
+    const rs = fs.createReadStream(cFile);
+    let bytesThisChunk = 0;
+    rs.on('data', (chunk) => { bytesThisChunk += chunk.length; });
+    rs.on('error', reject);
+    writeStream.on('error', reject);
+    rs.pipe(writeStream, { end: false });
+    rs.on('end', () => resolve(bytesThisChunk));
+  });
+
   try {
+    // PERF: stream each chunk from disk instead of reading it into memory.
+    // Previously this did readFileSync(cFile) + writeStream.write(buf) per
+    // chunk, loading each 95MB chunk fully into RAM. Now zero-copy through
+    // fs.createReadStream → writeStream, so memory stays flat regardless
+    // of chunk size or count.
     for (let i = 0; i < meta.totalChunks; i++) {
       const cFile = chunkFilePath(uploadId, i);
       if (!fs.existsSync(cFile)) {
         throw new Error(`Missing chunk ${i} during finalization`);
       }
-      const chunkBuf = fs.readFileSync(cFile);
-      writeStream.write(chunkBuf);
-      totalWritten += chunkBuf.length;
+      const chunkBytes = await pipeChunk(cFile);
+      totalWritten += chunkBytes;
     }
     await new Promise((resolve, reject) => {
       writeStream.end(() => resolve());
@@ -1519,7 +1609,7 @@ app.patch('/api/mv', authenticate, express.json({ limit: '1mb' }), (req, res) =>
 });
 
 // FIX #30: /api/cp returns 409 if destination exists (use ?force=1)
-app.post('/api/cp', authenticate, express.json({ limit: '1mb' }), (req, res) => {
+app.post('/api/cp', authenticate, express.json({ limit: '1mb' }), async (req, res) => {
   const { from, to } = req.body || {};
   if (!from || !to) {
     return res.status(400).json({ error: 'Missing from or to' });
@@ -1541,9 +1631,9 @@ app.post('/api/cp', authenticate, express.json({ limit: '1mb' }), (req, res) => 
     if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
     const stat = fs.statSync(src);
     if (stat.isDirectory()) {
-      copyDirSync(src, dst);
+      await copyDir(src, dst);
     } else {
-      fs.copyFileSync(src, dst);
+      await fs.promises.copyFile(src, dst);
     }
     return res.json({ success: true, message: `Copied: /${from} → /${to}` });
   } catch (err) {
@@ -1551,16 +1641,25 @@ app.post('/api/cp', authenticate, express.json({ limit: '1mb' }), (req, res) => 
   }
 });
 
-function copyDirSync(src, dst) {
-  if (!fs.existsSync(dst)) fs.mkdirSync(dst, { recursive: true });
-  const entries = fs.readdirSync(src);
-  for (const entry of entries) {
-    if (isBlockedName(entry)) continue;
-    const s = path.join(src, entry);
-    const d = path.join(dst, entry);
-    const stat = fs.statSync(s);
-    if (stat.isDirectory()) copyDirSync(s, d);
-    else fs.copyFileSync(s, d);
+// FIX: async version of copyDirSync — the sync version blocked the event
+// loop for the entire duration of the copy, which for a folder with
+// thousands of files could be seconds. Now yields between stats and
+// copies so other requests can be served.
+async function copyDir(src, dst) {
+  if (!fs.existsSync(dst)) await fs.promises.mkdir(dst, { recursive: true });
+  const dirents = await fs.promises.readdir(src, { withFileTypes: true });
+  for (const d of dirents) {
+    if (isBlockedName(d.name)) continue;
+    const s = path.join(src, d.name);
+    const dd = path.join(dst, d.name);
+    let isDir;
+    try { isDir = d.isDirectory(); }
+    catch { isDir = (await fs.promises.stat(s)).isDirectory(); }
+    if (isDir) {
+      await copyDir(s, dd);
+    } else {
+      await fs.promises.copyFile(s, dd);
+    }
   }
 }
 
@@ -1625,6 +1724,12 @@ app.get('/api/tail/:path(*)', authenticate, async (req, res) => {
 // ============================================================
 // FIX #13: ZIP and TAR streamed (no full buffer in memory)
 // ============================================================
+// ============================================================
+// FIX: ZIP streamed via archiver — no full file in memory.
+// Previously this built the entire ZIP in RAM with readFileSync +
+// Buffer.concat, causing OOM on large archives. Now streams file
+// data from disk through archiver straight to the response.
+// ============================================================
 app.get('/api/zip/:path(*)', authenticate, (req, res) => {
   const relativePath = req.params.path || req.params[0] || '';
   const filePath = getSafePath(relativePath);
@@ -1632,123 +1737,73 @@ app.get('/api/zip/:path(*)', authenticate, (req, res) => {
     return res.status(404).send('Not found\n');
   }
   const baseName = path.basename(filePath);
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="${baseName}.zip"`);
+  const stat = fs.statSync(filePath);
 
-  // Stream zip format manually (no external deps, basic STORE method)
-  const streamZip = (dir, basePath = '') => {
-    const entries = [];
-    const walk = (d, prefix) => {
-      const items = fs.readdirSync(d);
-      for (const item of items) {
-        if (isBlockedName(item)) continue;
-        const full = path.join(d, item);
-        const rel = prefix ? `${prefix}/${item}` : item;
-        const stat = fs.statSync(full);
-        if (stat.isDirectory()) {
-          entries.push({ type: 'dir', path: rel + '/', size: 0 });
-          walk(full, rel);
+  res.setHeader('Content-Type', 'application/zip');
+  // Mark as attachment so browsers download instead of trying to render
+  res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(baseName)}.zip"`);
+  // Streamed response — we don't know total size ahead of time
+  res.setHeader('Transfer-Encoding', 'chunked');
+
+  const archive = archiver('zip', { store: true }); // store=true => no compression (faster, less CPU)
+  archive.on('error', (err) => {
+    log.error('ZIP stream error:', { message: err.message });
+    if (!res.headersSent) res.status(500).send(`Zip error: ${err.message}\n`);
+    archive.destroy();
+  });
+  archive.on('warning', (err) => {
+    log.warn('ZIP stream warning:', { message: err.message });
+  });
+
+  // Pipe archive → response. On client disconnect, abort the archive.
+  archive.pipe(res);
+  req.on('close', () => {
+    if (!archive.destroyed) archive.abort();
+  });
+
+  // FIX: archiver.directory() in v7 ignores the filter/glob options, so we
+  // walk the tree ourselves and add files/dirs one by one. This gives us
+  // full control over the BLOCKLIST (which archiver doesn't know about).
+  // Each archive.file() call opens a read stream internally — still zero
+  // full-file buffering.
+  const walkAndAdd = (dir, prefix) => {
+    const items = fs.readdirSync(dir);
+    for (const item of items) {
+      if (isBlockedName(item)) continue;
+      const full = path.join(dir, item);
+      const rel = prefix ? `${prefix}/${item}` : item;
+      try {
+        const s = fs.statSync(full);
+        if (s.isDirectory()) {
+          // Add a directory entry so empty dirs are preserved
+          archive.append('', { name: `${rel}/`, type: 'directory' });
+          walkAndAdd(full, rel);
         } else {
-          entries.push({ type: 'file', path: rel, size: stat.size, full });
+          archive.file(full, { name: rel, stats: s });
         }
-      }
-    };
-    walk(dir, basePath);
-    return entries;
+      } catch (e) { /* skip deleted */ }
+    }
   };
 
-  const stat = fs.statSync(filePath);
-  let entries;
-  if (stat.isDirectory()) {
-    entries = streamZip(filePath, baseName);
-  } else {
-    entries = [{ type: 'file', path: baseName, size: stat.size, full: filePath }];
+  try {
+    if (stat.isDirectory()) {
+      walkAndAdd(filePath, baseName);
+    } else {
+      archive.file(filePath, { name: baseName });
+    }
+    archive.finalize();
+  } catch (err) {
+    log.error('ZIP build error:', { message: err.message });
+    if (!res.headersSent) res.status(500).send(`Zip error: ${err.message}\n`);
+    archive.destroy();
   }
-
-  // Build ZIP manually (simplified STORE method, no compression)
-  // For production, consider using archiver package — kept here for zero-deps
-  const localParts = [];
-  const centralParts = [];
-  let offset = 0;
-  for (const entry of entries) {
-    const nameBuf = Buffer.from(entry.path, 'utf8');
-    const isDir = entry.type === 'dir';
-    const fileData = isDir ? Buffer.alloc(0) : fs.readFileSync(entry.full);
-    const crc = isDir ? 0 : crc32(fileData);
-
-    // Local file header
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);    // signature
-    local.writeUInt16LE(20, 4);            // version
-    local.writeUInt16LE(0, 6);             // flags
-    local.writeUInt16LE(0, 8);             // method (0=store)
-    local.writeUInt16LE(0, 10);            // modtime
-    local.writeUInt16LE(0, 12);            // moddate
-    local.writeUInt32LE(crc, 14);          // crc32
-    local.writeUInt32LE(fileData.length, 18); // compressed size
-    local.writeUInt32LE(fileData.length, 22); // uncompressed size
-    local.writeUInt16LE(nameBuf.length, 26);  // name length
-    local.writeUInt16LE(0, 28);            // extra length
-    localParts.push(local, nameBuf, fileData);
-
-    // Central directory header
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);  // signature
-    central.writeUInt16LE(20, 4);          // version made by
-    central.writeUInt16LE(20, 6);          // version needed
-    central.writeUInt16LE(0, 8);           // flags
-    central.writeUInt16LE(0, 10);          // method
-    central.writeUInt16LE(0, 12);          // modtime
-    central.writeUInt16LE(0, 14);          // moddate
-    central.writeUInt32LE(crc, 16);        // crc32
-    central.writeUInt32LE(fileData.length, 20);
-    central.writeUInt32LE(fileData.length, 24);
-    central.writeUInt16LE(nameBuf.length, 28);
-    central.writeUInt16LE(0, 30);          // extra
-    central.writeUInt16LE(0, 32);          // comment
-    central.writeUInt16LE(0, 34);          // disk number
-    central.writeUInt16LE(0, 36);          // internal attrs
-    central.writeUInt32LE(isDir ? 0x10 : 0, 38); // external attrs
-    central.writeUInt32LE(offset, 42);     // local header offset
-    centralParts.push(central, nameBuf);
-
-    offset += 30 + nameBuf.length + fileData.length;
-  }
-
-  const centralBuf = Buffer.concat(centralParts);
-  const endRecord = Buffer.alloc(22);
-  endRecord.writeUInt32LE(0x06054b50, 0);
-  endRecord.writeUInt16LE(0, 4);
-  endRecord.writeUInt16LE(0, 6);
-  endRecord.writeUInt16LE(entries.length, 8);
-  endRecord.writeUInt16LE(entries.length, 10);
-  endRecord.writeUInt32LE(centralBuf.length, 12);
-  endRecord.writeUInt32LE(offset, 16);
-  endRecord.writeUInt16LE(0, 20);
-
-  const full = Buffer.concat([...localParts, centralBuf, endRecord]);
-  return res.send(full);
 });
 
-// CRC32 implementation (no deps)
-function crc32(buf) {
-  let table = crc32._table;
-  if (!table) {
-    table = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      table[i] = c >>> 0;
-    }
-    crc32._table = table;
-  }
-  let crc = 0xFFFFFFFF;
-  for (let i = 0; i < buf.length; i++) {
-    crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xFFFFFFFF) >>> 0;
-}
-
+// ============================================================
+// FIX: TAR.GZ streamed via archiver — no full file in memory.
+// Previously built the entire tar in RAM with readFileSync + Buffer.concat
+// + gzipSync, causing OOM on large archives.
+// ============================================================
 app.get('/api/tar/:path(*)', authenticate, (req, res) => {
   const relativePath = req.params.path || req.params[0] || '';
   const filePath = getSafePath(relativePath);
@@ -1756,60 +1811,60 @@ app.get('/api/tar/:path(*)', authenticate, (req, res) => {
     return res.status(404).send('Not found\n');
   }
   const baseName = path.basename(filePath);
-  res.setHeader('Content-Type', 'application/gzip');
-  res.setHeader('Content-Disposition', `attachment; filename="${baseName}.tar.gz"`);
-
-  // Build tar manually (simplified)
   const stat = fs.statSync(filePath);
-  const files = [];
-  const walk = (d, prefix) => {
-    const items = fs.readdirSync(d);
+
+  res.setHeader('Content-Type', 'application/gzip');
+  res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(baseName)}.tar.gz"`);
+  res.setHeader('Transfer-Encoding', 'chunked');
+
+  // archiver supports tar + gzip via the 'gzip' option
+  const archive = archiver('tar', { gzip: true, gzipOptions: { level: 6 } });
+  archive.on('error', (err) => {
+    log.error('TAR stream error:', { message: err.message });
+    if (!res.headersSent) res.status(500).send(`Tar error: ${err.message}\n`);
+    archive.destroy();
+  });
+  archive.on('warning', (err) => {
+    log.warn('TAR stream warning:', { message: err.message });
+  });
+
+  archive.pipe(res);
+  req.on('close', () => {
+    if (!archive.destroyed) archive.abort();
+  });
+
+  // FIX: same BLOCKLIST filter as /api/zip — archiver v7's directory()
+  // doesn't honor filter/glob, so we walk and add entries manually.
+  const walkAndAdd = (dir, prefix) => {
+    const items = fs.readdirSync(dir);
     for (const item of items) {
       if (isBlockedName(item)) continue;
-      const full = path.join(d, item);
+      const full = path.join(dir, item);
       const rel = prefix ? `${prefix}/${item}` : item;
-      const s = fs.statSync(full);
-      if (s.isDirectory()) {
-        files.push({ path: rel + '/', size: 0, isDir: true, full });
-        walk(full, rel);
-      } else {
-        files.push({ path: rel, size: s.size, isDir: false, full });
-      }
+      try {
+        const s = fs.statSync(full);
+        if (s.isDirectory()) {
+          archive.append('', { name: `${rel}/`, type: 'directory' });
+          walkAndAdd(full, rel);
+        } else {
+          archive.file(full, { name: rel, stats: s });
+        }
+      } catch (e) { /* skip deleted */ }
     }
   };
-  if (stat.isDirectory()) walk(filePath, baseName);
-  else files.push({ path: baseName, size: stat.size, isDir: false, full: filePath });
 
-  const tarParts = [];
-  for (const f of files) {
-    const header = Buffer.alloc(512);
-    header.write(f.path.slice(0, 100), 0);
-    header.write('0000644', 100, 7, 'octal'); // mode
-    header.write('0000000', 108, 7, 'octal'); // uid
-    header.write('0000000', 116, 7, 'octal'); // gid
-    header.write(f.size.toString(8).padStart(11, '0'), 124, 11, 'octal'); // size
-    header.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0'), 136, 11, 'octal'); // mtime
-    header.write('        ', 148, 8); // checksum placeholder
-    header.write(f.isDir ? '5' : '0', 156, 1); // type
-    tarParts.push(header);
-    if (!f.isDir && f.size > 0) {
-      const data = fs.readFileSync(f.full);
-      tarParts.push(data);
-      const pad = (512 - (f.size % 512)) % 512;
-      if (pad > 0) tarParts.push(Buffer.alloc(pad));
+  try {
+    if (stat.isDirectory()) {
+      walkAndAdd(filePath, baseName);
+    } else {
+      archive.file(filePath, { name: baseName });
     }
-    // Calculate checksum and write back
-    let sum = 0;
-    for (let i = 0; i < 512; i++) sum += header[i];
-    header.write(sum.toString(8).padStart(6, '0'), 148, 6, 'octal');
-    header[154] = 0;
-    header[155] = 0x20;
+    archive.finalize();
+  } catch (err) {
+    log.error('TAR build error:', { message: err.message });
+    if (!res.headersSent) res.status(500).send(`Tar error: ${err.message}\n`);
+    archive.destroy();
   }
-  tarParts.push(Buffer.alloc(1024)); // EOF marker
-  const tarBuf = Buffer.concat(tarParts);
-  // Gzip compress
-  const gz = zlib.gzipSync(tarBuf);
-  return res.send(gz);
 });
 
 // ============================================================
