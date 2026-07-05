@@ -351,6 +351,21 @@ const authenticate = (req, res, next) => {
 
   const isCurl = req.headers['user-agent'] && req.headers['user-agent'].includes('curl');
   const wantsJson = req.headers.accept && req.headers.accept.includes('application/json');
+  // FIX: WebDAV clients (Dolphin, Finder, Windows Explorer, Nautilus) only
+  // prompt for credentials when the 401 response carries a
+  // `WWW-Authenticate: Basic realm="..."` header. Without it, Dolphin silently
+  // fails to open the folder with no login dialog. We detect WebDAV paths
+  // and emit the challenge so clients know to send Basic auth.
+  // NOTE: when this middleware runs inside a router mounted at /webdav or
+  // /dav, req.path is the path RELATIVE to the mount point (e.g. "/" or
+  // "/subdir"), so we must check req.baseUrl too. req.originalUrl always
+  // contains the full URL, which is the safest check.
+  const fullPath = req.baseUrl + req.path;
+  const isWebDAVPath = fullPath.startsWith('/webdav') || fullPath.startsWith('/dav')
+    || req.originalUrl.startsWith('/webdav') || req.originalUrl.startsWith('/dav');
+  if (isWebDAVPath) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="FileVault", charset="UTF-8"');
+  }
 
   if (wantsJson) {
     return res.status(401).json({ error: 'Unauthorized. Invalid or missing token.' });
